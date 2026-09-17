@@ -1,7 +1,9 @@
 <?php
 require_once 'config/database.php';
 require_once 'config/session.php';
+require_once 'config/admin.php';
 
+ensureAdminSchema($pdo);
 redirectIfLoggedIn();
 
 $error = '';
@@ -18,7 +20,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $error = 'パスワードを入力してください。';
     } else {
         try {
-            $stmt = $pdo->prepare("SELECT id, name, email, password FROM users WHERE email = ?");
+            $stmt = $pdo->prepare("SELECT id, name, email, password, is_admin FROM users WHERE email = ?");
             $stmt->execute([$email]);
             $user = $stmt->fetch();
             
@@ -27,6 +29,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $_SESSION['user_id'] = $user['id'];
                 $_SESSION['user_name'] = $user['name'];
                 $_SESSION['user_email'] = $user['email'];
+                $_SESSION['is_admin'] = ((int)($user['is_admin'] ?? 0) === 1);
                 
                 // ログイン成功メッセージをセッションに保存
                 $_SESSION['login_success'] = true;
@@ -105,6 +108,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 <div class="form-actions">
                     <button type="submit" class="btn btn-primary">ログイン</button>
                     <a href="register.php" class="btn btn-secondary">新規登録</a>
+                    <a href="admin_login.php" class="btn btn-secondary">管理者ログイン</a>
                 </div>
             </form>
         </main>

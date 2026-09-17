@@ -4,6 +4,12 @@ ob_start();
 
 require_once 'config/database.php';
 require_once 'config/session.php';
+require_once 'config/admin.php';
+require_once 'config/profile.php';
+
+ensureAdminSchema($pdo);
+ensureProfileSchema($pdo);
+refreshAdminSession($pdo);
 
 if (!isset($_SESSION['csrf_token'])) {
     $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
@@ -95,28 +101,100 @@ function buildListUrl(string $sort, string $keyword, string $author, string $cat
     return 'index.php?' . http_build_query($params);
 }
 
-$stmt = $pdo->query("SHOW COLUMNS FROM posts LIKE 'user_id'");
-$hasPostUserIdColumn = (bool)$stmt->fetch();
+function canManagePostRow(array $post, ?int $currentUserId, string $currentUserName, bool $hasPostUserIdColumn): bool
+{
+    if ($currentUserId === null) {
+        return false;
+    }
 
-$hasUserIsAdminColumn = false;
-try {
-    $stmt = $pdo->query("SHOW COLUMNS FROM users LIKE 'is_admin'");
-    $hasUserIsAdminColumn = (bool)$stmt->fetch();
-} catch (PDOException $e) {
-    $hasUserIsAdminColumn = false;
+    $postUserId = $post['user_id'] ?? null;
+    if ($hasPostUserIdColumn && $postUserId !== null && $postUserId !== '') {
+        if ((int)$postUserId === $currentUserId) {
+            return true;
+        }
+    }
+
+    $author = trim((string)($post['author'] ?? ''));
+    $userName = trim($currentUserName);
+
+    return $author !== '' && $author === $userName;
 }
 
-$isAdmin = false;
-if (isLoggedIn()) {
-    if ($hasUserIsAdminColumn) {
-        $stmt = $pdo->prepare("SELECT is_admin FROM users WHERE id = ?");
-        $stmt->execute([$currentUserId]);
-        $isAdmin = ((int)$stmt->fetchColumn() === 1);
-    } else {
-        // 既存環境向けフォールバック
-        $isAdmin = ($currentUserName === '管理者');
+$hasPostUserIdColumn = false;
+try {
+    $stmt = $pdo->query("SHOW COLUMNS FROM posts LIKE 'user_id'");
+    $hasPostUserIdColumn = (bool)$stmt->fetch();
+} catch (PDOException $e) {
+    $hasPostUserIdColumn = false;
+}
+
+if (!$hasPostUserIdColumn) {
+    try {
+        $pdo->exec("ALTER TABLE posts ADD COLUMN user_id INT NULL");
+        try {
+            $pdo->exec(
+                "ALTER TABLE posts ADD CONSTRAINT fk_posts_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL"
+            );
+        } catch (PDOException $e) {
+            // 外部キー追加に失敗してもカラム自体は利用可能
+        }
+        $hasPostUserIdColumn = true;
+    } catch (PDOException $e) {
+        $hasPostUserIdColumn = false;
     }
 }
+
+if ($hasPostUserIdColumn) {
+    try {
+        $pdo->exec(
+            "UPDATE posts p
+             INNER JOIN (
+                 SELECT name, MIN(id) AS id
+                 FROM users
+                 GROUP BY name
+             ) u ON u.name = p.author
+             SET p.user_id = u.id
+             WHERE p.user_id IS NULL"
+        );
+    } catch (PDOException $e) {
+        // 既存投稿の user_id 補完に失敗しても続行
+    }
+}
+
+try {
+    $pdo->exec(
+        "CREATE TABLE IF NOT EXISTS post_likes (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            post_id INT NOT NULL,
+            user_id INT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            CONSTRAINT fk_post_likes_post FOREIGN KEY (post_id) REFERENCES posts(id) ON DELETE CASCADE,
+            CONSTRAINT fk_post_likes_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+            UNIQUE KEY uk_post_likes_post_user (post_id, user_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+    );
+} catch (PDOException $e) {
+    // いいね機能用テーブル作成に失敗した場合は後続処理でエラー表示
+}
+
+try {
+    $pdo->exec(
+        "CREATE TABLE IF NOT EXISTS post_replies (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            post_id INT NOT NULL,
+            user_id INT NOT NULL,
+            content TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            CONSTRAINT fk_post_replies_post FOREIGN KEY (post_id) REFERENCES posts(id) ON DELETE CASCADE,
+            CONSTRAINT fk_post_replies_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+    );
+} catch (PDOException $e) {
+    // 返信機能用テーブル作成に失敗した場合は後続処理でエラー表示
+}
+
+$isAdmin = isAdmin();
 
 
 $hasPostPinnedColumn = false;
@@ -288,11 +366,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
                     $isOwner = false;
                     if ($targetPost) {
-                        if ($hasPostUserIdColumn && isset($targetPost['user_id']) && $targetPost['user_id'] !== null) {
-                            $isOwner = ((int)$targetPost['user_id'] === (int)$currentUserId);
-                        } else {
-                            $isOwner = isset($targetPost['author']) && ($targetPost['author'] === $currentUserName);
-                        }
+                        $isOwner = canManagePostRow($targetPost, $currentUserId !== null ? (int)$currentUserId : null, $currentUserName, $hasPostUserIdColumn);
                     }
 
                     if (!$targetPost || (!$isOwner && !$isAdmin)) {
@@ -329,14 +403,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         $stmt->execute([$postId]);
                         $targetPost = $stmt->fetch();
 
-                        $canEdit = false;
-                        if ($targetPost) {
-                            if ($hasPostUserIdColumn && isset($targetPost['user_id']) && $targetPost['user_id'] !== null) {
-                                $canEdit = ((int)$targetPost['user_id'] === (int)$currentUserId);
-                            } else {
-                                $canEdit = isset($targetPost['author']) && ($targetPost['author'] === $currentUserName);
-                            }
-                        }
+                        $canEdit = $targetPost && canManagePostRow($targetPost, (int)$currentUserId, $currentUserName, $hasPostUserIdColumn);
 
                         if (!$canEdit) {
                             $error = '自分の投稿のみ編集できます。';
@@ -370,21 +437,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $stmt->execute([$postId]);
                     $targetPost = $stmt->fetch();
 
-                    $canDelete = false;
-                    if ($targetPost) {
-                        if ($hasPostUserIdColumn && isset($targetPost['user_id']) && $targetPost['user_id'] !== null) {
-                            $canDelete = ((int)$targetPost['user_id'] === (int)$currentUserId);
-                        } else {
-                            $canDelete = isset($targetPost['author']) && ($targetPost['author'] === $currentUserName);
-                        }
-                    }
+                    $canDelete = $targetPost && (
+                        isAdmin()
+                        || canManagePostRow($targetPost, (int)$currentUserId, $currentUserName, $hasPostUserIdColumn)
+                    );
 
                     if (!$canDelete) {
-                        $error = '自分の投稿のみ削除できます。';
+                        $error = '削除する権限がありません。';
                     } else {
-                        $stmt = $pdo->prepare("DELETE FROM posts WHERE id = ?");
-                        $stmt->execute([$postId]);
-                        $success = '投稿を削除しました。';
+                        $result = deletePostFully($pdo, $postId);
+                        if ($result['ok']) {
+                            $success = '投稿を削除しました。';
+                        } else {
+                            $error = $result['error'] ?? '削除に失敗しました。';
+                        }
                     }
                 }
             }
@@ -481,6 +547,7 @@ if (!empty($postIds)) {
         "SELECT
             r.id,
             r.post_id,
+            r.user_id,
             r.content,
             r.created_at,
             u.name AS user_name
@@ -526,7 +593,7 @@ if (isLoggedIn()) {
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>掲示板アプリ</title>
-    <link rel="stylesheet" href="css/style.css?v=3">
+    <link rel="stylesheet" href="css/style.css?v=7">
 </head>
 <body>
     <div class="container">
@@ -534,6 +601,11 @@ if (isLoggedIn()) {
             <h1>掲示板アプリ</h1>
             <div class="header-actions">
                 <?php if (isLoggedIn()): ?>
+                    <?php if (isAdmin()): ?>
+                        <a href="admin_posts.php" class="btn btn-admin">投稿管理</a>
+                        <a href="admin_users.php" class="btn btn-admin">ユーザー一覧</a>
+                    <?php endif; ?>
+                    <a href="profile.php?id=<?php echo (int)$_SESSION['user_id']; ?>" class="btn btn-secondary">マイプロフィール</a>
                     <details class="notification-menu">
                         <summary class="btn btn-secondary">
                             通知<?php if ($unreadNotificationCount > 0): ?> (<?php echo $unreadNotificationCount; ?>)<?php endif; ?>
@@ -562,12 +634,16 @@ if (isLoggedIn()) {
                             <?php endif; ?>
                         </div>
                     </details>
-                    <span class="user-info">ようこそ、<?php echo htmlspecialchars($_SESSION['user_name']); ?>さん</span>
+                    <span class="user-info">
+                        ようこそ、<a class="user-name-link" href="profile.php?id=<?php echo (int)$_SESSION['user_id']; ?>"><?php echo htmlspecialchars($_SESSION['user_name']); ?></a>さん
+                        <?php if (isAdmin()): ?><span class="admin-badge">管理者</span><?php endif; ?>
+                    </span>
                     <a href="post.php" class="btn btn-primary">新規投稿</a>
                     <a href="logout.php" class="btn btn-secondary">ログアウト</a>
                 <?php else: ?>
                     <a href="login.php" class="btn btn-primary">ログインして新規投稿</a>
                     <a href="register.php" class="btn btn-secondary">新規登録</a>
+                    <a href="admin_login.php" class="btn btn-secondary">管理者ログイン</a>
                 <?php endif; ?>
             </div>
         </header>
@@ -582,7 +658,14 @@ if (isLoggedIn()) {
             <?php endif; ?>
 
             <?php if (isset($_SESSION['login_success'])): ?>
-                <div class="alert alert-success">ログインに成功しました。ようこそ、<?php echo htmlspecialchars($_SESSION['user_name']); ?>さん！</div>
+                <div class="alert alert-success">
+                    <?php if (!empty($_SESSION['admin_login'])): ?>
+                        管理者としてログインしました。投稿管理・ユーザー一覧から管理できます。
+                        <?php unset($_SESSION['admin_login']); ?>
+                    <?php else: ?>
+                        ログインに成功しました。ようこそ、<?php echo htmlspecialchars($_SESSION['user_name']); ?>さん！
+                    <?php endif; ?>
+                </div>
                 <?php unset($_SESSION['login_success']); ?>
             <?php endif; ?>
             
@@ -668,7 +751,24 @@ if (isLoggedIn()) {
                                     <?php echo htmlspecialchars($post['title']); ?>
                                 </h2>
                                 <div class="post-meta">
-                                    <span class="author">投稿者: <?php echo htmlspecialchars($post['author']); ?></span>
+                                    <span class="author">
+                                        投稿者:
+                                        <?php
+                                            $authorProfileId = 0;
+                                            if (!empty($post['user_id'])) {
+                                                $authorProfileId = (int)$post['user_id'];
+                                            } else {
+                                                $authorProfileId = findUserIdByName($pdo, (string)($post['author'] ?? ''));
+                                            }
+                                        ?>
+                                        <?php if ($authorProfileId > 0): ?>
+                                            <a class="user-name-link" href="profile.php?id=<?php echo $authorProfileId; ?>">
+                                                <?php echo htmlspecialchars($post['author']); ?>
+                                            </a>
+                                        <?php else: ?>
+                                            <?php echo htmlspecialchars($post['author']); ?>
+                                        <?php endif; ?>
+                                    </span>
                                     <?php if ($hasPostCategoryColumn): ?>
                                         <span class="category">カテゴリ: <?php echo htmlspecialchars($post['category'] ?? '雑談'); ?></span>
                                     <?php endif; ?>
@@ -699,17 +799,14 @@ if (isLoggedIn()) {
                                 </form>
 
                                 <?php
-                                    $postUserId = $post['user_id'] ?? null;
-                                    $canManagePost = false;
-                                    $canPinPost = false;
-                                    if (isLoggedIn()) {
-                                        if ($hasPostUserIdColumn && $postUserId !== null) {
-                                            $canManagePost = ((int)$postUserId === (int)$currentUserId);
-                                        } else {
-                                            $canManagePost = (($post['author'] ?? '') === $currentUserName);
-                                        }
-                                        $canPinPost = $canManagePost || $isAdmin;
-                                    }
+                                    $canManagePost = canManagePostRow(
+                                        $post,
+                                        $currentUserId !== null ? (int)$currentUserId : null,
+                                        $currentUserName,
+                                        $hasPostUserIdColumn
+                                    );
+                                    $canPinPost = isLoggedIn() && ($canManagePost || $isAdmin);
+                                    $canDeletePost = isLoggedIn() && ($canManagePost || $isAdmin);
                                 ?>
                                 <?php if ($canPinPost): ?>
                                     <form method="POST" class="inline-form">
@@ -754,7 +851,8 @@ if (isLoggedIn()) {
                                             <button type="submit" class="btn btn-primary">保存</button>
                                         </form>
                                     </details>
-
+                                <?php endif; ?>
+                                <?php if ($canDeletePost): ?>
                                     <form method="POST" class="inline-form" onsubmit="return confirm('この投稿を削除しますか？');">
                                         <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($_SESSION['csrf_token']); ?>">
                                         <input type="hidden" name="action" value="delete_post">
@@ -763,6 +861,9 @@ if (isLoggedIn()) {
                                     </form>
                                 <?php endif; ?>
                             </div>
+                            <?php if (!isLoggedIn()): ?>
+                                <p class="post-login-note">いいね・編集・削除・ピン留めには<a href="login.php">ログイン</a>が必要です。</p>
+                            <?php endif; ?>
 
                             <section class="replies">
                                 <h3>返信</h3>
@@ -774,7 +875,15 @@ if (isLoggedIn()) {
                                             <li class="reply-item">
                                                 <p class="reply-content"><?php echo nl2br(htmlspecialchars($reply['content'])); ?></p>
                                                 <div class="reply-meta">
-                                                    <span><?php echo htmlspecialchars($reply['user_name']); ?></span>
+                                                    <span>
+                                                        <?php if (!empty($reply['user_id'])): ?>
+                                                            <a class="user-name-link" href="profile.php?id=<?php echo (int)$reply['user_id']; ?>">
+                                                                <?php echo htmlspecialchars($reply['user_name']); ?>
+                                                            </a>
+                                                        <?php else: ?>
+                                                            <?php echo htmlspecialchars($reply['user_name']); ?>
+                                                        <?php endif; ?>
+                                                    </span>
                                                     <span><?php echo date('Y年m月d日 H:i', strtotime($reply['created_at'])); ?></span>
                                                 </div>
                                             </li>
