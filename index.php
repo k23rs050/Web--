@@ -6,9 +6,12 @@ require_once 'config/database.php';
 require_once 'config/session.php';
 require_once 'config/admin.php';
 require_once 'config/profile.php';
+require_once 'config/categories.php';
+require_once 'config/upload.php';
 
 ensureAdminSchema($pdo);
 ensureProfileSchema($pdo);
+ensureImageSchema($pdo);
 refreshAdminSession($pdo);
 
 if (!isset($_SESSION['csrf_token'])) {
@@ -230,27 +233,28 @@ try {
     // ブックマーク機能用テーブル作成に失敗した場合は後続処理でエラー表示
 }
 
-$hasPostCategoryColumn = false;
-try {
-    $stmt = $pdo->query("SHOW COLUMNS FROM posts LIKE 'category'");
-    $hasPostCategoryColumn = (bool)$stmt->fetch();
-} catch (PDOException $e) {
-    $hasPostCategoryColumn = false;
+$hasPostCategoryColumn = ensureCategoryColumn($pdo);
+$categoryFlatOptions = getCategoryFlatOptions();
+$categoryFilter = trim((string)($_GET['category'] ?? 'all'));
+if ($categoryFilter === '') {
+    $categoryFilter = 'all';
 }
-
-if (!$hasPostCategoryColumn) {
-    try {
-        $pdo->exec("ALTER TABLE posts ADD COLUMN category VARCHAR(20) NOT NULL DEFAULT '雑談'");
-        $hasPostCategoryColumn = true;
-    } catch (PDOException $e) {
-        $hasPostCategoryColumn = false;
+if ($categoryFilter !== 'all' && (!$hasPostCategoryColumn || !isValidCategoryPath($categoryFilter))) {
+    // 旧データの単一カテゴリ名も許可
+    if (!$hasPostCategoryColumn || !array_key_exists($categoryFilter, $categoryFlatOptions)) {
+        $topLevel = array_keys(getCategoryTree());
+        if (!in_array($categoryFilter, $topLevel, true)) {
+            $categoryFilter = 'all';
+        }
     }
 }
 
-$categoryOptions = ['料理', 'スポーツ', '娯楽', '勉強', '雑談', '連絡'];
-$categoryFilter = $_GET['category'] ?? 'all';
-if ($categoryFilter !== 'all' && (!in_array($categoryFilter, $categoryOptions, true) || !$hasPostCategoryColumn)) {
-    $categoryFilter = 'all';
+$hasPostImageColumn = false;
+try {
+    $stmt = $pdo->query("SHOW COLUMNS FROM posts LIKE 'image_path'");
+    $hasPostImageColumn = (bool)$stmt->fetch();
+} catch (PDOException $e) {
+    $hasPostImageColumn = false;
 }
 
 $allowedSorts = ['newest', 'likes'];
@@ -388,31 +392,72 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $title = trim($_POST['title'] ?? '');
                     $content = trim($_POST['content'] ?? '');
                     $category = trim((string)($_POST['category'] ?? '雑談'));
+                    $removeImage = isset($_POST['remove_image']);
+                    $imageUpload = saveUploadedImage($_FILES['image'] ?? [], 'posts', 'post' . $postId);
+
                     if ($title === '' || $content === '') {
                         $error = 'タイトルと内容を入力してください。';
                     } elseif (strlen($title) > 255) {
                         $error = 'タイトルは255文字以内で入力してください。';
-                    } elseif ($hasPostCategoryColumn && !in_array($category, $categoryOptions, true)) {
+                    } elseif ($hasPostCategoryColumn && !isValidCategoryPath($category)) {
                         $error = 'カテゴリを選択してください。';
+                    } elseif (!$imageUpload['ok']) {
+                        $error = $imageUpload['error'] ?? '画像のアップロードに失敗しました。';
                     } else {
                         if ($hasPostUserIdColumn) {
-                            $stmt = $pdo->prepare("SELECT user_id, author FROM posts WHERE id = ?");
+                            $stmt = $pdo->prepare("SELECT user_id, author, image_path FROM posts WHERE id = ?");
                         } else {
-                            $stmt = $pdo->prepare("SELECT author FROM posts WHERE id = ?");
+                            $stmt = $pdo->prepare("SELECT author, image_path FROM posts WHERE id = ?");
                         }
-                        $stmt->execute([$postId]);
-                        $targetPost = $stmt->fetch();
+                        try {
+                            $stmt->execute([$postId]);
+                            $targetPost = $stmt->fetch();
+                        } catch (PDOException $e) {
+                            if ($hasPostUserIdColumn) {
+                                $stmt = $pdo->prepare("SELECT user_id, author FROM posts WHERE id = ?");
+                            } else {
+                                $stmt = $pdo->prepare("SELECT author FROM posts WHERE id = ?");
+                            }
+                            $stmt->execute([$postId]);
+                            $targetPost = $stmt->fetch();
+                            if ($targetPost) {
+                                $targetPost['image_path'] = null;
+                            }
+                        }
 
                         $canEdit = $targetPost && canManagePostRow($targetPost, (int)$currentUserId, $currentUserName, $hasPostUserIdColumn);
 
                         if (!$canEdit) {
                             $error = '自分の投稿のみ編集できます。';
+                            if (!empty($imageUpload['path'])) {
+                                deleteUploadedFile($imageUpload['path']);
+                            }
                         } else {
-                            if ($hasPostCategoryColumn) {
+                            $imagePath = $targetPost['image_path'] ?? null;
+                            if ($removeImage) {
+                                deleteUploadedFile($imagePath);
+                                $imagePath = null;
+                            }
+                            if (!empty($imageUpload['path'])) {
+                                deleteUploadedFile($imagePath);
+                                $imagePath = $imageUpload['path'];
+                            }
+
+                            if ($hasPostCategoryColumn && $hasPostImageColumn) {
+                                $stmt = $pdo->prepare(
+                                    "UPDATE posts SET title = ?, content = ?, category = ?, image_path = ? WHERE id = ?"
+                                );
+                                $stmt->execute([$title, $content, $category, $imagePath, $postId]);
+                            } elseif ($hasPostCategoryColumn) {
                                 $stmt = $pdo->prepare(
                                     "UPDATE posts SET title = ?, content = ?, category = ? WHERE id = ?"
                                 );
                                 $stmt->execute([$title, $content, $category, $postId]);
+                            } elseif ($hasPostImageColumn) {
+                                $stmt = $pdo->prepare(
+                                    "UPDATE posts SET title = ?, content = ?, image_path = ? WHERE id = ?"
+                                );
+                                $stmt->execute([$title, $content, $imagePath, $postId]);
                             } else {
                                 $stmt = $pdo->prepare(
                                     "UPDATE posts SET title = ?, content = ? WHERE id = ?"
@@ -475,8 +520,14 @@ if ($authorKeyword !== '') {
     $whereParams[] = '%' . $authorKeyword . '%';
 }
 if ($categoryFilter !== 'all' && $hasPostCategoryColumn) {
-    $whereParts[] = "p.category = ?";
-    $whereParams[] = $categoryFilter;
+    $filterValues = getCategoryFilterValues($categoryFilter);
+    if (!empty($filterValues)) {
+        $placeholders = implode(',', array_fill(0, count($filterValues), '?'));
+        $whereParts[] = "p.category IN ($placeholders)";
+        foreach ($filterValues as $v) {
+            $whereParams[] = $v;
+        }
+    }
 }
 if ($savedOnly && isLoggedIn()) {
     $whereParts[] = "pb.user_id IS NOT NULL";
@@ -593,7 +644,7 @@ if (isLoggedIn()) {
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>掲示板アプリ</title>
-    <link rel="stylesheet" href="css/style.css?v=7">
+    <link rel="stylesheet" href="css/style.css?v=9">
 </head>
 <body>
     <div class="container">
@@ -683,16 +734,9 @@ if (isLoggedIn()) {
                             <option value="likes" <?php echo ($sort === 'likes') ? 'selected' : ''; ?>>いいね順</option>
                         </select>
                     </div>
-                    <div class="list-controls-item">
-                        <label for="category">カテゴリ</label>
-                        <select id="category" name="category">
-                            <option value="all" <?php echo ($categoryFilter === 'all') ? 'selected' : ''; ?>>すべて</option>
-                            <?php foreach ($categoryOptions as $c): ?>
-                                <option value="<?php echo htmlspecialchars($c); ?>" <?php echo ($categoryFilter === $c) ? 'selected' : ''; ?>>
-                                    <?php echo htmlspecialchars($c); ?>
-                                </option>
-                            <?php endforeach; ?>
-                        </select>
+                    <div class="list-controls-item list-controls-category">
+                        <label>カテゴリ</label>
+                        <?php echo renderCategoryCascadeSelects($categoryFilter, 'category', 'filter-cat', false, true); ?>
                     </div>
                     <div class="list-controls-item list-controls-search">
                         <label for="q">キーワード検索</label>
@@ -770,7 +814,7 @@ if (isLoggedIn()) {
                                         <?php endif; ?>
                                     </span>
                                     <?php if ($hasPostCategoryColumn): ?>
-                                        <span class="category">カテゴリ: <?php echo htmlspecialchars($post['category'] ?? '雑談'); ?></span>
+                                        <span class="category">カテゴリ: <?php echo htmlspecialchars(formatCategoryLabel($post['category'] ?? '雑談')); ?></span>
                                     <?php endif; ?>
                                     <span class="date"><?php echo date('Y年m月d日 H:i', strtotime($post['created_at'])); ?></span>
                                 </div>
@@ -778,6 +822,13 @@ if (isLoggedIn()) {
                             <div class="post-content">
                                 <?php echo nl2br(htmlspecialchars($post['content'])); ?>
                             </div>
+                            <?php if (!empty($post['image_path'])): ?>
+                                <div class="post-image-wrap">
+                                    <a href="<?php echo htmlspecialchars($post['image_path']); ?>" target="_blank" rel="noopener">
+                                        <img class="post-image" src="<?php echo htmlspecialchars($post['image_path']); ?>" alt="投稿画像">
+                                    </a>
+                                </div>
+                            <?php endif; ?>
 
                             <div class="post-actions">
                                 <form method="POST" class="inline-form">
@@ -821,7 +872,7 @@ if (isLoggedIn()) {
                                 <?php if ($canManagePost): ?>
                                     <details class="post-edit">
                                         <summary class="btn btn-edit">編集</summary>
-                                        <form method="POST" class="edit-form">
+                                        <form method="POST" class="edit-form" enctype="multipart/form-data">
                                             <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($_SESSION['csrf_token']); ?>">
                                             <input type="hidden" name="action" value="edit_post">
                                             <input type="hidden" name="post_id" value="<?php echo (int)$post['id']; ?>">
@@ -832,22 +883,35 @@ if (isLoggedIn()) {
                                             <?php if ($hasPostCategoryColumn): ?>
                                                 <div class="form-group">
                                                     <label>カテゴリ</label>
-                                                    <select name="category" required>
-                                                        <?php foreach ($categoryOptions as $c): ?>
-                                                            <option
-                                                                value="<?php echo htmlspecialchars($c); ?>"
-                                                                <?php echo (($post['category'] ?? '雑談') === $c) ? 'selected' : ''; ?>
-                                                            >
-                                                                <?php echo htmlspecialchars($c); ?>
-                                                            </option>
-                                                        <?php endforeach; ?>
-                                                    </select>
+                                                    <?php echo renderCategoryCascadeSelects(
+                                                        (string)($post['category'] ?? '雑談'),
+                                                        'category',
+                                                        'edit-cat-' . (int)$post['id'],
+                                                        true,
+                                                        false
+                                                    ); ?>
                                                 </div>
                                             <?php endif; ?>
                                             <div class="form-group">
                                                 <label>内容</label>
                                                 <textarea name="content" rows="4" required><?php echo htmlspecialchars($post['content']); ?></textarea>
                                             </div>
+                                            <?php if ($hasPostImageColumn): ?>
+                                                <div class="form-group">
+                                                    <label>画像</label>
+                                                    <?php if (!empty($post['image_path'])): ?>
+                                                        <div class="post-image-wrap post-image-edit">
+                                                            <img class="post-image" src="<?php echo htmlspecialchars($post['image_path']); ?>" alt="現在の画像">
+                                                        </div>
+                                                        <label class="checkbox-inline">
+                                                            <input type="checkbox" name="remove_image" value="1">
+                                                            現在の画像を削除する
+                                                        </label>
+                                                    <?php endif; ?>
+                                                    <input type="file" name="image" accept="image/jpeg,image/png,image/gif,image/webp">
+                                                    <p class="form-help">JPEG / PNG / GIF / WebP（2MB以内）・未選択なら現状維持</p>
+                                                </div>
+                                            <?php endif; ?>
                                             <button type="submit" class="btn btn-primary">保存</button>
                                         </form>
                                     </details>

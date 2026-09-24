@@ -1,9 +1,13 @@
 <?php
 require_once 'config/database.php';
 require_once 'config/session.php';
+require_once 'config/categories.php';
+require_once 'config/upload.php';
 
-// このページはログイン必須
 requireLogin();
+
+ensureCategoryColumn($pdo);
+ensureImageSchema($pdo);
 
 $error = '';
 $success = '';
@@ -11,40 +15,28 @@ $success = '';
 $stmt = $pdo->query("SHOW COLUMNS FROM posts LIKE 'user_id'");
 $hasPostUserIdColumn = (bool)$stmt->fetch();
 
-$hasPostCategoryColumn = false;
-try {
-    $stmt = $pdo->query("SHOW COLUMNS FROM posts LIKE 'category'");
-    $hasPostCategoryColumn = (bool)$stmt->fetch();
-} catch (PDOException $e) {
-    $hasPostCategoryColumn = false;
-}
+$hasPostCategoryColumn = ensureCategoryColumn($pdo);
 
-if (!$hasPostCategoryColumn) {
-    try {
-        $pdo->exec("ALTER TABLE posts ADD COLUMN category VARCHAR(20) NOT NULL DEFAULT '雑談'");
-        $hasPostCategoryColumn = true;
-    } catch (PDOException $e) {
-        $hasPostCategoryColumn = false;
-    }
-}
-
-$categoryOptions = ['料理', 'スポーツ', '娯楽', '勉強', '雑談', '連絡'];
+$title = '';
+$content = '';
+$category = '雑談';
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $title = trim($_POST['title'] ?? '');
     $content = trim($_POST['content'] ?? '');
     $category = trim((string)($_POST['category'] ?? '雑談'));
 
-    // ログインしている前提でセッションから名前を取得
     $author = $_SESSION['user_name'] ?? '';
     $userId = $_SESSION['user_id'] ?? null;
-    
-    // バリデーション
+
+    $imageUpload = saveUploadedImage($_FILES['image'] ?? [], 'posts', 'post');
+    $imagePath = null;
+
     if (empty($title)) {
         $error = 'タイトルを入力してください。';
     } elseif (empty($content)) {
         $error = '内容を入力してください。';
-    } elseif ($hasPostCategoryColumn && !in_array($category, $categoryOptions, true)) {
+    } elseif ($hasPostCategoryColumn && !isValidCategoryPath($category)) {
         $error = 'カテゴリを選択してください。';
     } elseif (empty($author)) {
         $error = '投稿者名を取得できませんでした。もう一度ログインし直してください。';
@@ -54,32 +46,42 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $error = '投稿者名は100文字以内で入力してください。';
     } elseif ($hasPostUserIdColumn && empty($userId)) {
         $error = 'ユーザー情報を取得できませんでした。もう一度ログインし直してください。';
+    } elseif (!$imageUpload['ok']) {
+        $error = $imageUpload['error'] ?? '画像のアップロードに失敗しました。';
     } else {
+        $imagePath = $imageUpload['path'];
         try {
+            // image_path カラムを必ず使う（無い場合はここで追加して再実行）
+            ensureImageSchema($pdo);
+
             if ($hasPostUserIdColumn) {
-                try {
-                    $stmt = $pdo->prepare("INSERT INTO posts (title, content, author, user_id, category) VALUES (?, ?, ?, ?, ?)");
-                    $stmt->execute([$title, $content, $author, $userId, $category]);
-                } catch (PDOException $e) {
-                    $stmt = $pdo->prepare("INSERT INTO posts (title, content, author, user_id) VALUES (?, ?, ?, ?)");
-                    $stmt->execute([$title, $content, $author, $userId]);
-                }
+                $stmt = $pdo->prepare(
+                    "INSERT INTO posts (title, content, author, user_id, category, image_path) VALUES (?, ?, ?, ?, ?, ?)"
+                );
+                $stmt->execute([$title, $content, $author, $userId, $category, $imagePath]);
             } else {
-                try {
-                    $stmt = $pdo->prepare("INSERT INTO posts (title, content, author, category) VALUES (?, ?, ?, ?)");
-                    $stmt->execute([$title, $content, $author, $category]);
-                } catch (PDOException $e) {
-                    $stmt = $pdo->prepare("INSERT INTO posts (title, content, author) VALUES (?, ?, ?)");
-                    $stmt->execute([$title, $content, $author]);
-                }
+                $stmt = $pdo->prepare(
+                    "INSERT INTO posts (title, content, author, category, image_path) VALUES (?, ?, ?, ?, ?)"
+                );
+                $stmt->execute([$title, $content, $author, $category, $imagePath]);
             }
             $success = '投稿が正常に作成されました。';
-            // フォームをクリア
+            if ($imagePath) {
+                $success .= '（画像も添付しました）';
+            }
             $title = $content = '';
             $category = '雑談';
         } catch (PDOException $e) {
+            if ($imagePath) {
+                deleteUploadedFile($imagePath);
+            }
             $error = '投稿の作成に失敗しました。';
+            error_log('post.php insert: ' . $e->getMessage());
         }
+    }
+
+    if ($error !== '' && !empty($imageUpload['path'])) {
+        deleteUploadedFile($imageUpload['path']);
     }
 }
 ?>
@@ -90,7 +92,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>新規投稿 - 掲示板アプリ</title>
-    <link rel="stylesheet" href="css/style.css?v=6">
+    <link rel="stylesheet" href="css/style.css?v=9">
 </head>
 <body>
     <div class="container">
@@ -103,27 +105,24 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             <?php if ($error): ?>
                 <div class="alert alert-error"><?php echo htmlspecialchars($error); ?></div>
             <?php endif; ?>
-            
+
             <?php if ($success): ?>
                 <div class="alert alert-success"><?php echo htmlspecialchars($success); ?></div>
             <?php endif; ?>
 
-            <form method="POST" class="post-form">
+            <form method="POST" class="post-form" enctype="multipart/form-data">
                 <div class="form-group">
                     <label for="title">タイトル *</label>
-                    <input type="text" id="title" name="title" value="<?php echo htmlspecialchars($title ?? ''); ?>" required maxlength="255">
+                    <input type="text" id="title" name="title" value="<?php echo htmlspecialchars($title); ?>" required maxlength="255">
                 </div>
 
-                <div class="form-group">
-                    <label for="category">カテゴリ *</label>
-                    <select id="category" name="category" required>
-                        <?php foreach ($categoryOptions as $c): ?>
-                            <option value="<?php echo htmlspecialchars($c); ?>" <?php echo (($category ?? '雑談') === $c) ? 'selected' : ''; ?>>
-                                <?php echo htmlspecialchars($c); ?>
-                            </option>
-                        <?php endforeach; ?>
-                    </select>
-                </div>
+                <?php if ($hasPostCategoryColumn): ?>
+                    <div class="form-group">
+                        <label>カテゴリ *</label>
+                        <p class="form-help">大・中・小の最大3階層から選べます（中・小は任意）。</p>
+                        <?php echo renderCategoryCascadeSelects($category, 'category', 'post-cat', true, false); ?>
+                    </div>
+                <?php endif; ?>
 
                 <div class="form-group">
                     <label>投稿者名</label>
@@ -132,7 +131,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
                 <div class="form-group">
                     <label for="content">内容 *</label>
-                    <textarea id="content" name="content" rows="10" required><?php echo htmlspecialchars($content ?? ''); ?></textarea>
+                    <textarea id="content" name="content" rows="10" required><?php echo htmlspecialchars($content); ?></textarea>
+                </div>
+
+                <div class="form-group">
+                    <label for="image">画像（任意）</label>
+                    <input type="file" id="image" name="image" accept="image/jpeg,image/png,image/gif,image/webp">
+                    <p class="form-help">JPEG / PNG / GIF / WebP（2MB以内）</p>
                 </div>
 
                 <div class="form-actions">
@@ -144,6 +149,3 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     </div>
 </body>
 </html>
-
-
-

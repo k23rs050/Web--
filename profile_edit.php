@@ -4,9 +4,11 @@ require_once 'config/database.php';
 require_once 'config/session.php';
 require_once 'config/admin.php';
 require_once 'config/profile.php';
+require_once 'config/upload.php';
 
 ensureAdminSchema($pdo);
 ensureProfileSchema($pdo);
+ensureImageSchema($pdo);
 refreshAdminSession($pdo);
 requireLogin();
 
@@ -38,6 +40,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $bio = trim($_POST['bio'] ?? '');
         $hobby = trim($_POST['hobby'] ?? '');
         $location = trim($_POST['location'] ?? '');
+        $removeAvatar = isset($_POST['remove_avatar']);
 
         if ($name === '') {
             $error = '名前を入力してください。';
@@ -50,38 +53,67 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         } elseif (mb_strlen($location) > 100) {
             $error = '居住地・所属は100文字以内で入力してください。';
         } else {
-            try {
-                $stmt = $pdo->prepare("SELECT id FROM users WHERE name = ? AND id <> ?");
-                $stmt->execute([$name, $userId]);
-                if ($stmt->fetch()) {
-                    $error = 'この名前は既に使われています。';
-                } else {
-                    $stmt = $pdo->prepare(
-                        "UPDATE users SET name = ?, bio = ?, hobby = ?, location = ? WHERE id = ?"
-                    );
-                    $stmt->execute([
-                        $name,
-                        $bio === '' ? null : $bio,
-                        $hobby === '' ? null : $hobby,
-                        $location === '' ? null : $location,
-                        $userId,
-                    ]);
+            $newAvatarPath = null;
+            $avatarUpload = saveUploadedImage($_FILES['avatar'] ?? [], 'avatars', 'avatar' . $userId);
+            if (!$avatarUpload['ok']) {
+                $error = $avatarUpload['error'] ?? '画像のアップロードに失敗しました。';
+            } else {
+                $newAvatarPath = $avatarUpload['path'];
+            }
 
-                    // 表示名変更に合わせて投稿の author も更新
-                    try {
-                        $stmt = $pdo->prepare("UPDATE posts SET author = ? WHERE user_id = ?");
-                        $stmt->execute([$name, $userId]);
-                    } catch (PDOException $e) {
-                        // author 更新に失敗してもプロフィール自体は保存済み
+            if ($error === '') {
+                try {
+                    $stmt = $pdo->prepare("SELECT id FROM users WHERE name = ? AND id <> ?");
+                    $stmt->execute([$name, $userId]);
+                    if ($stmt->fetch()) {
+                        $error = 'この名前は既に使われています。';
+                        if ($newAvatarPath) {
+                            deleteUploadedFile($newAvatarPath);
+                        }
+                    } else {
+                        $avatarValue = $user['avatar'] ?? null;
+                        if ($removeAvatar) {
+                            deleteUploadedFile($avatarValue);
+                            $avatarValue = null;
+                        }
+                        if ($newAvatarPath) {
+                            deleteUploadedFile($avatarValue);
+                            $avatarValue = $newAvatarPath;
+                        }
+
+                        $stmt = $pdo->prepare(
+                            "UPDATE users SET name = ?, bio = ?, hobby = ?, location = ?, avatar = ? WHERE id = ?"
+                        );
+                        $stmt->execute([
+                            $name,
+                            $bio === '' ? null : $bio,
+                            $hobby === '' ? null : $hobby,
+                            $location === '' ? null : $location,
+                            $avatarValue,
+                            $userId,
+                        ]);
+
+                        try {
+                            $stmt = $pdo->prepare("UPDATE posts SET author = ? WHERE user_id = ?");
+                            $stmt->execute([$name, $userId]);
+                        } catch (PDOException $e) {
+                            // author 更新に失敗してもプロフィール自体は保存済み
+                        }
+
+                        $_SESSION['user_name'] = $name;
+                        $success = 'プロフィールを保存しました。';
+                        $user = getUserProfile($pdo, $userId);
+                        $bio = (string)($user['bio'] ?? '');
+                        $hobby = (string)($user['hobby'] ?? '');
+                        $location = (string)($user['location'] ?? '');
                     }
-
-                    $_SESSION['user_name'] = $name;
-                    $success = 'プロフィールを保存しました。';
-                    $user = getUserProfile($pdo, $userId);
+                } catch (PDOException $e) {
+                    if ($newAvatarPath) {
+                        deleteUploadedFile($newAvatarPath);
+                    }
+                    $error = '保存中にエラーが発生しました。';
+                    error_log('profile_edit: ' . $e->getMessage());
                 }
-            } catch (PDOException $e) {
-                $error = '保存中にエラーが発生しました。';
-                error_log('profile_edit: ' . $e->getMessage());
             }
         }
     }
@@ -93,7 +125,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>プロフィール編集 - 掲示板アプリ</title>
-    <link rel="stylesheet" href="css/style.css?v=7">
+    <link rel="stylesheet" href="css/style.css?v=9">
 </head>
 <body>
     <div class="container">
@@ -106,7 +138,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         </header>
 
         <main>
-            <p class="admin-page-intro">自己紹介や趣味などを登録・編集できます。</p>
+            <p class="admin-page-intro">自己紹介や趣味、アイコン画像を登録・編集できます。</p>
 
             <?php if ($error): ?>
                 <div class="alert alert-error"><?php echo htmlspecialchars($error); ?></div>
@@ -115,8 +147,23 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 <div class="alert alert-success"><?php echo htmlspecialchars($success); ?></div>
             <?php endif; ?>
 
-            <form method="POST" class="post-form">
+            <form method="POST" class="post-form" enctype="multipart/form-data">
                 <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($_SESSION['csrf_token']); ?>">
+
+                <div class="form-group">
+                    <label>アイコン画像</label>
+                    <div class="avatar-edit-preview">
+                        <?php echo renderUserAvatarHtml($user, 'avatar-preview'); ?>
+                    </div>
+                    <input type="file" id="avatar" name="avatar" accept="image/jpeg,image/png,image/gif,image/webp">
+                    <p class="form-help">JPEG / PNG / GIF / WebP（2MB以内）</p>
+                    <?php if (!empty($user['avatar'])): ?>
+                        <label class="checkbox-inline">
+                            <input type="checkbox" name="remove_avatar" value="1">
+                            現在のアイコン画像を削除する
+                        </label>
+                    <?php endif; ?>
+                </div>
 
                 <div class="form-group">
                     <label for="name">表示名 *</label>

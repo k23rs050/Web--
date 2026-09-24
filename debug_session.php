@@ -27,3 +27,4 @@ echo "<p><a href='index.php'>ホームに戻る</a></p>";
 echo "<p><a href='login.php'>ログインページ</a></p>";
 ?>
 
+

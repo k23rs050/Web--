@@ -3,8 +3,11 @@ ob_start();
 require_once 'config/database.php';
 require_once 'config/session.php';
 require_once 'config/admin.php';
+require_once 'config/categories.php';
+require_once 'config/upload.php';
 
 ensureAdminSchema($pdo);
+ensureImageSchema($pdo);
 refreshAdminSession($pdo);
 requireAdmin();
 
@@ -146,7 +149,7 @@ try {
                                     <td><?php echo (int)$post['id']; ?></td>
                                     <td><?php echo htmlspecialchars($post['title']); ?></td>
                                     <td><?php echo htmlspecialchars($post['author']); ?></td>
-                                    <td><?php echo htmlspecialchars($post['category'] ?? '雑談'); ?></td>
+                                    <td><?php echo htmlspecialchars(formatCategoryLabel($post['category'] ?? '雑談')); ?></td>
                                     <td><?php echo (int)$post['like_count']; ?></td>
                                     <td><?php echo (int)$post['reply_count']; ?></td>
                                     <td><?php echo ((int)($post['is_pinned'] ?? 0) === 1) ? '固定' : '-'; ?></td>

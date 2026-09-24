@@ -4,6 +4,7 @@ require_once 'config/database.php';
 require_once 'config/session.php';
 require_once 'config/admin.php';
 require_once 'config/profile.php';
+require_once 'config/categories.php';
 
 ensureAdminSchema($pdo);
 ensureProfileSchema($pdo);
@@ -61,7 +62,7 @@ if ($user) {
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title><?php echo $user ? htmlspecialchars($user['name']) . ' のプロフィール' : 'プロフィール'; ?> - 掲示板アプリ</title>
-    <link rel="stylesheet" href="css/style.css?v=7">
+    <link rel="stylesheet" href="css/style.css?v=9">
 </head>
 <body>
     <div class="container">
@@ -83,9 +84,7 @@ if ($user) {
                 </div>
             <?php else: ?>
                 <section class="profile-card">
-                    <div class="profile-avatar" aria-hidden="true">
-                        <?php echo htmlspecialchars(mb_substr($user['name'], 0, 1)); ?>
-                    </div>
+                    <?php echo renderUserAvatarHtml($user); ?>
                     <div class="profile-main">
                         <h2 class="profile-name">
                             <?php echo htmlspecialchars($user['name']); ?>
@@ -151,7 +150,7 @@ if ($user) {
                                         <?php echo htmlspecialchars($post['title']); ?>
                                     </a>
                                     <span class="profile-post-meta">
-                                        <?php echo htmlspecialchars($post['category'] ?? '雑談'); ?>
+                                        <?php echo htmlspecialchars(formatCategoryLabel($post['category'] ?? '雑談')); ?>
                                         ・
                                         <?php echo date('Y/m/d H:i', strtotime($post['created_at'])); ?>
                                     </span>

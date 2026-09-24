@@ -3,8 +3,11 @@ ob_start();
 require_once 'config/database.php';
 require_once 'config/session.php';
 require_once 'config/admin.php';
+require_once 'config/categories.php';
+require_once 'config/upload.php';
 
 ensureAdminSchema($pdo);
+ensureImageSchema($pdo);
 refreshAdminSession($pdo);
 requireAdmin();
 
@@ -103,7 +106,7 @@ if ($postId > 0) {
                         <div class="post-meta">
                             <span>ID: <?php echo (int)$post['id']; ?></span>
                             <span>投稿者: <?php echo htmlspecialchars($post['author']); ?></span>
-                            <span>カテゴリ: <?php echo htmlspecialchars($post['category'] ?? '雑談'); ?></span>
+                            <span>カテゴリ: <?php echo htmlspecialchars(formatCategoryLabel($post['category'] ?? '雑談')); ?></span>
                             <span>いいね: <?php echo $likeCount; ?></span>
                             <span>投稿: <?php echo date('Y年m月d日 H:i', strtotime($post['created_at'])); ?></span>
                             <span>更新: <?php echo date('Y年m月d日 H:i', strtotime($post['updated_at'])); ?></span>
@@ -112,6 +115,11 @@ if ($postId > 0) {
                     <div class="post-content">
                         <?php echo nl2br(htmlspecialchars($post['content'])); ?>
                     </div>
+                    <?php if (!empty($post['image_path'])): ?>
+                        <div class="post-image-wrap">
+                            <img class="post-image" src="<?php echo htmlspecialchars($post['image_path']); ?>" alt="投稿画像">
+                        </div>
+                    <?php endif; ?>
 
                     <form method="POST" class="admin-detail-actions" onsubmit="return confirm('この投稿を削除しますか？');">
                         <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($_SESSION['csrf_token']); ?>">
